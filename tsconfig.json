@@ -1,25 +1,17 @@
 {
   "$schema": "https://json.schemastore.org/tsconfig",
-  "display": "Node 12",
   "compilerOptions": {
-    "lib": [
-      "es2019",
-      "es2020.promise",
-      "es2020.bigint",
-      "es2020.string"
-    ],
-    "module": "CommonJS",
-    "target": "es2019",
+    "lib": ["es2022"],
+    "module": "commonjs",
+    "target": "es2022",
+    "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "outDir": "./dist",
     "rootDir": "./src",
     "moduleResolution": "node",
-    "inlineSourceMap": true,
-    "inlineSources": true
+    "sourceMap": true
   },
-  "include": [
-    "src/"
-  ]
+  "include": ["src/"]
 }

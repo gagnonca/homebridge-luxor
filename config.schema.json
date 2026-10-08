@@ -2,7 +2,7 @@
   "pluginAlias": "Luxor",
   "pluginType": "platform",
   "singular": false,
-  "headerDisplay": "This is a PLATFORM module for the [HomeBridge Platform](https://github.com/nfarina/homebridge) to control [FX Luminaire](http://www.FXL.com).  This plug-in enables power and brightness controls for [FX Luminaire Luxor ZD](http://www.fxl.com/product/power-and-control/luxor-zd) and, additionally color, on the [FX Luminaire Luxor ZDC](http://www.fxl.com/product/power-and-control/luxor-zdc).",
+  "headerDisplay": "Controls [FX Luminaire](https://www.fxl.com) Luxor ZD, ZDC and LXTWO lighting controllers: light groups (brightness, plus color on ZDC/LXTWO) and themes.",
   "footerDisplay": "",
   "schema": {
     "type": "object",
@@ -24,7 +24,7 @@
         "title": "Hide light groups (show only themes)",
         "type": "boolean"
       },
-      "noAllThemes":{
+      "noAllThemes": {
         "title": "Do not create the Illuminate All and Extinguish All themes",
         "type": "boolean"
       },
@@ -32,17 +32,34 @@
         "title": "Use independent colors for each Light Group (legacy behavior)",
         "type": "boolean"
       },
-      "commandTimeout":{
-        "title": "Adjust the amount of time (in milliseconds) that the plugin will wait for each HTTP request to the server",
+      "pollInterval": {
+        "title": "Polling interval (seconds)",
         "type": "integer",
-        "default": 750
+        "default": 30,
+        "minimum": 5,
+        "description": "How often to read light state from the controller, to pick up changes made outside HomeKit."
+      },
+      "commandTimeout": {
+        "title": "Request timeout (ms)",
+        "type": "integer",
+        "default": 2500,
+        "minimum": 500,
+        "description": "How long to wait for each attempt of a request to the controller. Older configs often have 750 here, which is too short for a busy controller."
+      },
+      "retries": {
+        "title": "Retries",
+        "type": "integer",
+        "default": 2,
+        "minimum": 0,
+        "maximum": 5,
+        "description": "How many times to retry a request that timed out or lost its connection."
       },
       "removeAccessories": {
         "title": "Remove specific accessory/accessories",
         "type": "string",
         "required": false,
         "default": "",
-        "description": "Enter specific UUID's separated by a comma to remove individual lights/themes before adding new ones.  After enabling this feature, restart Homebridge, then disable it and restart Homebrige."
+        "description": "Comma-separated accessory UUIDs or names to remove from HomeKit. Restart Homebridge, then clear this and restart again."
       },
       "removeAllAccessories": {
         "title": "Remove all accessory/accessories",
@@ -55,30 +72,30 @@
   },
   "layout": [
     {
-      "key": "Name",
-      "title": "Name",
-      "placeholder": "Luxor"
+      "key": "name"
     },
     {
-      "key": "ipAddr",
-      "title": "IP Address",
-      "placeholder": "192.168.0.1"
+      "key": "ipAddr"
     },
     {
-      "key": "hideGroups",
-      "placeholder": false
+      "key": "hideGroups"
     },
     {
-      "key": "noAllThemes",
-      "placeholder": false
+      "key": "noAllThemes"
     },
     {
-      "key": "independentColors", 
-      "placeholder": false
+      "key": "independentColors"
     },
     {
-      "key": "commandTimeout",
-      "placeholder": 750
+      "type": "section",
+      "title": "Connection",
+      "expandable": true,
+      "expanded": false,
+      "items": [
+        "pollInterval",
+        "commandTimeout",
+        "retries"
+      ]
     },
     {
       "type": "section",
@@ -86,16 +103,8 @@
       "expandable": true,
       "expanded": false,
       "items": [
-        {
-          "key": "removeAccessories",
-          "type": "string",
-          "notitle": false
-        },
-        {
-          "key": "removeAllAccessories",
-          "type": "boolean",
-          "notitle": false
-        }
+        "removeAccessories",
+        "removeAllAccessories"
       ]
     }
   ]

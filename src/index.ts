@@ -1,8 +1,6 @@
-require('source-map-support').install();
 import { API } from 'homebridge';
-import { LuxorPlatform } from './LuxorPlatform';
-
+import { LuxorPlatform, PLATFORM_NAME, PLUGIN_NAME } from './LuxorPlatform';
 
 export = (api: API) => {
-    api.registerPlatform("homebridge-luxor", "Luxor", LuxorPlatform);
+  api.registerPlatform(PLUGIN_NAME, PLATFORM_NAME, LuxorPlatform);
 };

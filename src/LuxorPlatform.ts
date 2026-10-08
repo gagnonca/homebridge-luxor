@@ -1,285 +1,183 @@
-const axios = require('axios').default;
-
-import { AxiosResponse } from 'axios';
 import { API, Characteristic, DynamicPlatformPlugin, Logger, PlatformAccessory, PlatformConfig, Service } from 'homebridge';
+import { LuxorClient, errorMessage, sleep } from './LuxorClient';
+import { ControllerType, LightType, LuxorController } from './LuxorController';
+import { GroupLight } from './lights/GroupLight';
+import { EXTINGUISH_ALL_INDEX, ILLUMINATE_ALL_INDEX, ThemeSwitch } from './lights/ThemeSwitch';
 
-import { BaseController, IControllerType, IGroupList, IThemeList } from './controller/BaseController';
-import { ControllerFactory } from './controller/ControllerFactory';
-import { LightFactory } from './lights/LightFactory';
-import { Theme } from './lights/Theme';
-import { ILightType } from './lights/ZD_Light';
+export const PLUGIN_NAME = 'homebridge-luxor';
+export const PLATFORM_NAME = 'Luxor';
 
+const DEFAULT_TIMEOUT_MS = 2500;
+const DEFAULT_RETRIES = 2;
+const DEFAULT_POLL_SECONDS = 30;
+const MIN_POLL_SECONDS = 5;
+const STARTUP_RETRY_DELAYS_S = [5, 10, 20, 40, 60];
 
+export interface AccessoryContext {
+  type: LightType;
+  groupNumber?: number;
+  themeIndex?: number;
+  lastBrightness?: number;
+  hue?: number;
+  saturation?: number;
+}
+
+interface DesiredAccessory {
+  uuid: string;
+  name: string;
+  context: AccessoryContext;
+}
 
 export class LuxorPlatform implements DynamicPlatformPlugin {
-    // this is used to track restored cached accessories
-    public accessories: PlatformAccessory[] = [];
-    public controller: BaseController;// will be assigned to ZD or ZDC controller
-    public Name: string;
-    public lastDateAdded: number;
-    public readonly Service: typeof Service;
-    public readonly Characteristic: typeof Characteristic;
-    private currGroupsAndThemes: IGroupList[] & IThemeList[] = [];
+  public readonly Service: typeof Service;
+  public readonly Characteristic: typeof Characteristic;
+  private readonly accessories = new Map<string, PlatformAccessory>();
+  private controller?: LuxorController;
+  private shuttingDown = false;
 
-    constructor(
-        public readonly log: Logger,
-        public readonly config: PlatformConfig,
-        public readonly api: API
-    ) {
-        this.config = config;
-        this.log = log;
-        this.Service = this.api.hap.Service;
-        this.Characteristic = this.api.hap.Characteristic;
-        this.Name = config.name;
-        this.lastDateAdded = Date.now();
-        this.controller = ControllerFactory.createController({ type: 'base' }, this.log)
+  constructor(
+    public readonly log: Logger,
+    public readonly config: PlatformConfig,
+    public readonly api: API,
+  ) {
+    this.Service = api.hap.Service;
+    this.Characteristic = api.hap.Characteristic;
+    api.on('didFinishLaunching', () => this.start());
+    api.on('shutdown', () => {
+      this.shuttingDown = true;
+      this.controller?.stop();
+    });
+  }
 
-        if (api) {
-            // Save the API object as plugin needs to register new this.api.platformAccessory via this object.
-            this.api = api;
+  configureAccessory(accessory: PlatformAccessory): void {
+    this.log.debug(`Retrieved cached accessory ${accessory.displayName} with UUID ${accessory.UUID}`);
+    this.accessories.set(accessory.UUID, accessory);
+  }
 
-            // Listen to event "didFinishLaunching", this means homebridge already finished loading cached accessories
-            // Platform Plugin should only register new this.api.platformAccessory that doesn't exist in homebridge after this event.
-            // Or start discover new accessories
-            this.api.on('didFinishLaunching', this.didFinishLaunchingAsync.bind(this));
-        }
+  private async start(): Promise<void> {
+    if (!this.config.ipAddr) {
+      this.log.error(`${this.config.name || PLATFORM_NAME} needs an IP Address in the config.  See sample-config.json.`);
+      return;
     }
-    async sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+    // Only touch the accessory list after a complete, successful read of the controller.  Building
+    // it from a failed or partial read would delete accessories (and the automations and rooms
+    // that reference them) from HomeKit.
+    for (let attempt = 0; !this.shuttingDown; attempt++) {
+      try {
+        const controller = await this.connect();
+        this.syncAccessories(controller);
+        controller.startPolling();
+        this.controller = controller;
+        this.log.info('Finished initializing.');
+        return;
+      }
+      catch (err) {
+        const delay = STARTUP_RETRY_DELAYS_S[Math.min(attempt, STARTUP_RETRY_DELAYS_S.length - 1)];
+        this.log.warn(`Unable to reach Luxor controller at ${this.config.ipAddr} (${errorMessage(err)}).  Retrying in ${delay}s.`);
+        await sleep(delay * 1000);
+      }
     }
-    // Function invoked when homebridge tries to restore cached accessory
-    // Developer can configure accessory at here (like setup event handler)
-    configureAccessory(accessory: PlatformAccessory) {
-        this.log.debug(`Retrieved cached accessory ${accessory.displayName} with UUID ${accessory.UUID}`);
-        this.accessories[accessory.UUID] = accessory;
-    }
-    async getControllerAsync():Promise<boolean> {
-        // get the name of the controller
+  }
 
-        this.log.info(this.Name + ": Starting search for controller at: " + this.config.ipAddr);
-        try {
-            //Search for controllor and make sure we can find it
-            const response:AxiosResponse = await axios({
-                method: 'post',
-                url: 'http://' + this.config.ipAddr + '/ControllerName.json',
-                timeout: this.config.commandTimeout || 750
-              });
-              
-            if (response.status !== 200) { this.log.error('Received a status code of ' + response.status + ' when trying to connect to the controller.'); return false; }
-            let controllerNameData = response.data;
-            controllerNameData.ip = this.config.ipAddr;
-            controllerNameData.platform = this;
-            controllerNameData.commandTimeout = this.config.commandTimeout;
-            if (controllerNameData.Controller.substring(0, 5) === 'luxor') {
-                controllerNameData.type = IControllerType.ZD;
-            } else if (controllerNameData.Controller.substring(0, 5) === 'lxzdc') {
-                controllerNameData.type = IControllerType.ZDC;
-            } else if (controllerNameData.Controller.substring(0, 5) === 'lxtwo') {
-                controllerNameData.type = IControllerType.ZDTWO;
-            } else {
-                controllerNameData.type = IControllerType.ZDTWO;
-                this.log.info('Found unknown controller named %s of type %s, assuming a ZDTWO', controllerNameData.Controller, controllerNameData.type);
-            }
-            this.log.info(`Found Controller named ${controllerNameData.Controller} of type ${controllerNameData.type}.`);
-            this.controller = ControllerFactory.createController(controllerNameData, this.log);
-            return true;
-        }
-        catch (err) {
-            this.log.error(this.Name + ' was not able to connect to connect to the controller. ', err);
-            return false;
-        };
-
+  private async connect(): Promise<LuxorController> {
+    const client = new LuxorClient({
+      ip: this.config.ipAddr,
+      timeout: this.config.commandTimeout || DEFAULT_TIMEOUT_MS,
+      retries: this.config.retries ?? DEFAULT_RETRIES,
+      log: this.log,
+    });
+    const info = await client.request<{ Controller: string }>('ControllerName');
+    let type = LuxorController.detectType(info.Controller);
+    if (!type) {
+      type = ControllerType.ZDTWO;
+      this.log.info(`Found unknown controller named ${info.Controller}, assuming a ZDTWO.`);
     }
-    async getControllerGroupListAsync() {
-        // Get the list of light groups from the controller
-        if (this.config.hideGroups) return;
-        try {
-            let groupLists = await this.controller.GroupListGetAsync();
-            this.log.info(`Retrieved ${groupLists.length} light groups from controller.`);
-            for (var i in groupLists) {
-                this.currGroupsAndThemes.push(groupLists[i]);
-            }
-        }
-        catch (err) {
-            this.log.error(`was not able to retrieve light groups from controller.\n${err}\n${err}`);
-        };
-    }
-    async getControllerThemeListAsync() {
-        // Get the list of light LuxorThemes from the controller
-        try {
-            let themeLists = await this.controller.ThemeListGetAsync();
-            this.log.info(`Retrieved ${themeLists.length} themes from controller.`);
+    this.log.info(`Found controller ${info.Controller} (${type}) at ${this.config.ipAddr}.`);
 
-            if (typeof this.config.noAllThemes !== 'undefined' && this.config.noAllThemes){
-                this.log.info(`Not creating Illuminate All and Extinguish All themes per config setting.`);
-            }
-            else {
-                themeLists.push({
-                    Name: 'Illuminate all lights',
-                    ThemeIndex: 100,
-                    OnOff: 0,
-                    isOn: false,
-                    type: ILightType.THEME
-                });
-                themeLists.push({
-                    Name: 'Extinguish all lights',
-                    ThemeIndex: 101,
-                    OnOff: 0,
-                    isOn: false,
-                    type: ILightType.THEME
-                });
-            }
-            for (var i in themeLists) {
-                themeLists[i].type = ILightType.THEME;
-                this.currGroupsAndThemes.push(themeLists[i]);
-            }
-        }
-        catch (err) {
-            this.log.error('was not able to retrieve light themes from controller.', err);
-        };
+    const pollSeconds = Math.max(MIN_POLL_SECONDS, this.config.pollInterval || DEFAULT_POLL_SECONDS);
+    const controller = new LuxorController(info.Controller, type, client, this.log, {
+      pollInterval: pollSeconds * 1000,
+      hideGroups: !!this.config.hideGroups,
+    });
+    await controller.refresh();
+    this.log.info(`Retrieved ${controller.groups.size} light groups and ${controller.themes.size} themes.`);
+    return controller;
+  }
+
+  private desiredAccessories(controller: LuxorController): DesiredAccessory[] {
+    const uuid = this.api.hap.uuid;
+    const desired: DesiredAccessory[] = [];
+    // UUIDs must stay exactly as the original plugin generated them, or HomeKit sees new accessories.
+    for (const group of controller.groups.values()) {
+      desired.push({
+        uuid: uuid.generate(`luxor.group.-${group.number}`),
+        name: group.name,
+        context: { type: group.type, groupNumber: group.number },
+      });
+    }
+    const themes = [...controller.themes.values()].map(t => ({ index: t.index, name: t.name }));
+    if (this.config.noAllThemes) {
+      this.log.info('Not creating Illuminate All and Extinguish All themes per config setting.');
+    }
+    else {
+      themes.push({ index: ILLUMINATE_ALL_INDEX, name: 'Illuminate all lights' });
+      themes.push({ index: EXTINGUISH_ALL_INDEX, name: 'Extinguish all lights' });
+    }
+    for (const theme of themes) {
+      desired.push({
+        uuid: uuid.generate(`luxor.theme-${theme.index}`),
+        name: theme.name,
+        context: { type: LightType.THEME, themeIndex: theme.index },
+      });
+    }
+    return desired;
+  }
+
+  private syncAccessories(controller: LuxorController): void {
+    const removeList = String(this.config.removeAccessories || '').split(',').map(s => s.trim()).filter(Boolean);
+    for (const accessory of [...this.accessories.values()]) {
+      if (this.config.removeAllAccessories || removeList.includes(accessory.UUID) || removeList.includes(accessory.displayName)) {
+        this.log.info(`Removing cached accessory ${accessory.displayName} (${accessory.UUID}) per platform configuration.`);
+        this.unregister(accessory);
+      }
     }
 
-    removeAccessories() {
-        for (var UUID in this.accessories) {
-            let accessory = this.accessories[UUID];
-            if (typeof this.config.removeAllAccessories !== 'undefined' && this.config.removeAllAccessories || typeof this.config.removeAccessories !== 'undefined' && this.config.removeAccessories.includes(accessory.UUID)) {
-                this.log.info(`Removing cached accessory ${accessory.displayName} with UUID ${accessory.UUID} per platform configuration settings.`);
-                this.api.unregisterPlatformAccessories("homebridge-luxor", "Luxor", [accessory]);
-                this.accessories = this.accessories.filter(item => item.UUID !== UUID);
-            };
-        }
+    const desired = this.desiredAccessories(controller);
+    const desiredUUIDs = new Set(desired.map(d => d.uuid));
+    for (const accessory of [...this.accessories.values()]) {
+      if (!desiredUUIDs.has(accessory.UUID)) {
+        this.log.info(`Removing ${accessory.displayName} (${accessory.UUID}); it is no longer on the controller.`);
+        this.unregister(accessory);
+      }
     }
 
-    addGroupAccessory(lightGroup: IGroupList) {
-        var accessory = new this.api.platformAccessory(lightGroup.Name, lightGroup.UUID);
-        let context: IContext = {
-            lastDateAdded: this.lastDateAdded,
-            color: lightGroup.Color,
-            groupNumber: lightGroup.GroupNumber,
-            brightness: lightGroup.Intensity,
-            type: lightGroup.type,
-            isOn: lightGroup.Intensity > 0,
-            independentColors: this.config.independentColors,
-            commandTimeout: this.config.commandTimeout
-        }
-        accessory.context = context;
-        LightFactory.createLight(this, accessory);
-        this.api.registerPlatformAccessories("homebridge-luxor", "Luxor", [accessory]);
+    for (const d of desired) {
+      let accessory = this.accessories.get(d.uuid);
+      if (accessory) {
+        this.log.info(`Loading cached accessory ${d.name}.`);
+        accessory.displayName = d.name;
+        accessory.context = { ...accessory.context, ...d.context };
+        this.attach(accessory, controller);
+        this.api.updatePlatformAccessories([accessory]);
+      }
+      else {
+        this.log.info(`Adding new accessory ${d.name}.`);
+        accessory = new this.api.platformAccessory(d.name, d.uuid);
+        accessory.context = d.context;
+        this.attach(accessory, controller);
+        this.accessories.set(d.uuid, accessory);
+        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      }
     }
+  }
 
-    addThemeAccessory(themeGroup: IThemeList) {
-        var accessory = new this.api.platformAccessory(themeGroup.Name, themeGroup.UUID);
-        let context: IContext = {
-            lastDateAdded: this.lastDateAdded,
-            type: ILightType.THEME,
-            isOn: themeGroup.OnOff === 1,
-            themeIndex: themeGroup.ThemeIndex,
-            OnOff: themeGroup.OnOff,
-            commandTimeout: this.config.commandTimeout
-        }
-        accessory.context = context;
-        LightFactory.createLight(this, accessory);
-        this.accessories[accessory.UUID] = accessory;
-        this.api.registerPlatformAccessories("homebridge-luxor", "Luxor", [accessory]);
-    }
+  private attach(accessory: PlatformAccessory, controller: LuxorController): void {
+    if ((accessory.context as AccessoryContext).type === LightType.THEME) new ThemeSwitch(this, accessory, controller);
+    else new GroupLight(this, accessory, controller);
+  }
 
-    assignUUIDs() {
-        for (let i = 0; i < this.currGroupsAndThemes.length; i++) {
-            let acc = this.currGroupsAndThemes[i];
-            if (typeof acc.ThemeIndex !== 'undefined') {
-                acc.UUID = this.api.hap.uuid.generate('luxor.' + `theme-${acc.ThemeIndex}`);
-            }
-            else {
-                acc.UUID = this.api.hap.uuid.generate('luxor.' + `group.-${acc.GroupNumber}`);
-            }
-        }
-    }
-
-    async processAccessories() {
-        this.assignUUIDs();
-        this.removeAccessories()
-        for (var UUID in this.accessories) {
-            let cachedAcc = this.accessories[UUID];
-            // look for match on current devices
-            let remove = true;
-            for (let j = 0; j < this.currGroupsAndThemes.length; j++) {
-                let currAcc = this.currGroupsAndThemes[j];
-                if (cachedAcc.UUID === currAcc.UUID) {
-                    // found existing device
-                    this.log.info(`Loading cached accessory ${cachedAcc.displayName} with UUID ${cachedAcc.UUID}.`);
-                    // update cached device (name, etc)
-                    let context: IContext = cachedAcc.context as IContext;
-                    context.lastDateAdded = this.lastDateAdded;
-                    if (typeof currAcc.Color !== 'undefined') context.color = currAcc.Color;
-                    if (typeof currAcc.GroupNumber !== 'undefined') context.groupNumber = currAcc.GroupNumber;
-                    if (typeof currAcc.ThemeIndex !== 'undefined') context.themeIndex = currAcc.ThemeIndex;
-                    if (typeof currAcc.Intensity !== 'undefined') {
-                        context.brightness = currAcc.Intensity;
-                        context.isOn = currAcc.Intensity > 0;
-                    }
-                    if (typeof currAcc.type !== 'undefined') context.type = currAcc.type;
-                    if (typeof currAcc.isOn !== 'undefined') context.isOn = currAcc.isOn;
-                    if (typeof currAcc.Name !== 'undefined') cachedAcc.displayName = currAcc.Name;
-                    cachedAcc.context = context;
-                    this.api.updatePlatformAccessories([cachedAcc]);
-                    LightFactory.createLight(this, cachedAcc);
-                    this.currGroupsAndThemes.splice(j, 1);
-                    remove = false;
-                    break;
-                }
-            }
-            // remove the cachedAcc that can't be matched
-            if (remove) {
-                this.log.info(`Removing cached accessory ${cachedAcc.displayName} with UUID ${cachedAcc.UUID}.`);
-                this.api.unregisterPlatformAccessories("homebridge-luxor", "Luxor", [cachedAcc]);
-            }
-        }
-        // add any new accessories that were not previously matched
-        if (this.currGroupsAndThemes.length > 0) {
-            for (let j = 0; j < this.currGroupsAndThemes.length; j++) {
-                let currAcc = this.currGroupsAndThemes[j];
-                this.log.info(`Adding new accessory ${currAcc.Name} with UUID ${currAcc.UUID}.`);
-                if (currAcc.type === ILightType.THEME)
-                    this.addThemeAccessory(currAcc);
-                else
-                    this.addGroupAccessory(currAcc);
-            }
-        }
-    }
-
-    async didFinishLaunchingAsync() {
-        if (!this.config.ipAddr) {
-            this.log.error(this.Name + " needs an IP Address in the config file.  Please see sample_config.json.");
-        }
-        try {
-            while (await this.getControllerAsync() == false) {
-                this.log.info(`Unable to connect to Luxor controller.  Waiting 60s and will retry.`)
-                await this.sleep(60*1000);
-            }
-            //this.retrieveCachedAccessories();
-            await this.getControllerGroupListAsync();
-            await this.getControllerThemeListAsync();
-            await this.processAccessories();
-            // this.removeOphanedAccessories();
-            this.log.info('Finished initializing');
-        }
-        catch (err) {
-            this.log.error('Error in didFinishLaunching', err);
-        };
-    }
-}
-export interface IContext {
-    lastDateAdded: number;
-    groupNumber?: number;
-    brightness?: number;
-    type: ILightType
-    color?: number;
-    status?: any;
-    isOn: boolean;
-    hue?: number;
-    saturation?: number;
-    themeIndex?: number;
-    OnOff?: 0 | 1;
-    independentColors?: boolean;
-    commandTimeout: number;
+  private unregister(accessory: PlatformAccessory): void {
+    this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+    this.accessories.delete(accessory.UUID);
+  }
 }
